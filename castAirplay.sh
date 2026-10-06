@@ -13,19 +13,19 @@
 # Optional: avahi-browse (discovery, names, auto port/encryption), curl or wget (remote playlists)
 
 set -uo pipefail
-
-UA="airplay-cast/1.0"
+ 
+UA="castAirplay/1.0"
 VOLUME=50 PASSWORD="" PORT="" ET="" LATENCY_MS=2000 DEBUG=0
 LOOP=0 RETRY=1 MAX_RETRIES=0 SCAN=0
 RAOP_BIN="${CLIRAOP:-}"
-
+ 
 log()  { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
-
+ 
 usage() {
     sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
     cat <<'EOF'
-
+ 
 Options:
   -v, --volume N        volume 0-100 (default 50)
   -p, --password PW     AirPlay password, if the receiver has one
@@ -41,7 +41,7 @@ Options:
 EOF
     exit "${1:-0}"
 }
-
+ 
 # ------------------------------------------------------------------------------ args
 ARGS=()
 while (($#)); do
@@ -64,7 +64,7 @@ while (($#)); do
     esac
     shift
 done
-
+ 
 # ------------------------------------------------------------------------------ mDNS (optional)
 # avahi-browse -p output: =;iface;IPv4;name;type;domain;host;address;port;"txt" "txt" ...
 unescape() {  # avahi escapes as \DDD (decimal), e.g. \064 = @, \032 = space
@@ -75,11 +75,11 @@ unescape() {  # avahi escapes as \DDD (decimal), e.g. \064 = @, \032 = space
     done
     printf '%s' "$out$s"
 }
-
+ 
 txt_get() {  # txt_get KEY "TXT RECORDS"
     [[ $2 =~ \"$1=([^\"]*)\" ]] && printf '%s' "${BASH_REMATCH[1]}"
 }
-
+ 
 # prints: name<TAB>ip<TAB>port<TAB>txt   (one line per IPv4 RAOP service)
 mdns_list() {
     command -v avahi-browse >/dev/null || return 1
@@ -90,7 +90,7 @@ mdns_list() {
         printf '%s\t%s\t%s\t%s\n' "$name" "$addr" "$port" "$txt"
     done < <(timeout 8 avahi-browse -rtp _raop._tcp 2>/dev/null) | sort -u
 }
-
+ 
 if ((SCAN)); then
     command -v avahi-browse >/dev/null || die "--scan needs avahi-browse (package avahi-utils)"
     printf '%-28s %-16s %-6s %-14s %s\n' NAME IP PORT MODEL ET
@@ -99,12 +99,17 @@ if ((SCAN)); then
     done
     exit 0
 fi
-
+ 
 ((${#ARGS[@]} == 2)) || usage 1
 SOURCE=${ARGS[0]} DEVICE=${ARGS[1]}
-
+ 
 # ------------------------------------------------------------------------------ dependencies
-command -v ffmpeg >/dev/null || die "ffmpeg not found"
+HERE=$(cd "$(dirname "$0")" && pwd)
+# ffmpeg: $FFMPEG, else a static ffmpeg next to this script (survives HA container rebuilds), else PATH
+FFMPEG=${FFMPEG:-}
+[[ -z $FFMPEG && -x $HERE/ffmpeg ]] && FFMPEG=$HERE/ffmpeg
+[[ -z $FFMPEG ]] && FFMPEG=$(command -v ffmpeg)
+[[ -n $FFMPEG && -x $FFMPEG ]] || die "ffmpeg not found - install it or put a static ffmpeg in $HERE"
 raop_runs() {  # exit 126/127 = kernel/loader can't start it (wrong arch, or needs glibc on musl)
     "$1" -h >/dev/null 2>&1; local rc=$?; ((rc != 126 && rc != 127))
 }
@@ -118,7 +123,7 @@ if [[ -z $RAOP_BIN ]]; then
 fi
 [[ -n $RAOP_BIN && -x $RAOP_BIN ]] || die "no usable cliraop - use the static cliraop-$(uname -m), or --raop PATH"
 raop_runs "$RAOP_BIN" || die "$RAOP_BIN can't run on this system - use the static cliraop-$(uname -m)"
-
+ 
 # ------------------------------------------------------------------------------ resolve device
 IP="" TXT="" MPORT=""
 if [[ $DEVICE =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -132,7 +137,7 @@ else
     [[ -n $entry ]] || die "no AirPlay receiver named '$DEVICE' (try --scan)"
     IFS=$'\t' read -r NAME IP MPORT TXT <<<"$entry"
 fi
-
+ 
 # connection parameters: explicit option > mDNS TXT > defaults
 [[ -n $PORT ]] && PORTS=("$PORT") || { [[ -n $MPORT ]] && PORTS=("$MPORT") || PORTS=(7000 5000); }
 [[ -z $ET ]] && ET=$(txt_get et "$TXT")
@@ -141,14 +146,14 @@ fi
 if [[ -n $ET ]]; then ETS=("$ET"); else ETS=("0" "0,4"); fi
 CANDS=(); for p in "${PORTS[@]}"; do for e in "${ETS[@]}"; do CANDS+=("$p $e"); done; done
 [[ $(txt_get pw "$TXT") == true && -z $PASSWORD ]] && die "receiver requires a password (-p)"
-
+ 
 RAOP_ARGS=(-v "$VOLUME" -l "$((LATENCY_MS * 441 / 10))" -d "$((DEBUG ? 6 : 1))")
 [[ -n $PASSWORD ]] && RAOP_ARGS+=(-P "$PASSWORD")
 am=$(txt_get am "$TXT"); [[ -n $am ]] && RAOP_ARGS+=(-o "$am")
 md=$(txt_get md "$TXT"); [[ -n $md ]] && RAOP_ARGS+=(-m "$md")
-
+ 
 log "Receiver: ${NAME:-$IP} ($IP, port ${PORTS[*]}, et=${ETS[*]})"
-
+ 
 # AirPlay 1 needs the receiver to reach back to us (UDP timing/control). From a NAT'd container
 # (Docker, Home Assistant add-on on 172.30.x.x) it can't, and the receiver silently never plays.
 if command -v ip >/dev/null; then
@@ -159,17 +164,17 @@ if command -v ip >/dev/null; then
         log "         port and will stay silent. Use host networking."
     fi
 fi
-
+ 
 # ------------------------------------------------------------------------------ resolve source
 is_url() { [[ $1 =~ ^https?:// ]]; }
-
+ 
 fetch() {
     if ! is_url "$1"; then cat -- "$1"
     elif command -v curl >/dev/null; then curl -fsSL --max-time 10 -A "$UA" -- "$1"
     elif command -v wget >/dev/null; then wget -q -T 10 -U "$UA" -O - -- "$1"
     else die "need curl or wget to read remote playlist $1"; fi
 }
-
+ 
 abs_entry() {  # make playlist entry $2 absolute relative to playlist $1
     local base=${1%%[?#]*} e=$2
     if is_url "$e"; then
@@ -186,7 +191,7 @@ abs_entry() {  # make playlist entry $2 absolute relative to playlist $1
         printf '%s/%s' "$(cd "$(dirname "$base")" && pwd)" "$e"
     fi
 }
-
+ 
 resolve() {  # prints one playable entry per line
     local src=$1 depth=${2:-0} path text e
     path=${src%%[?#]*}; path=${path,,}
@@ -203,32 +208,48 @@ resolve() {  # prints one playable entry per line
         [[ -n $e ]] && resolve "$(abs_entry "$src" "$e")" $((depth + 1))
     done
 }
-
+ 
 mapfile -t SOURCES < <(resolve "$SOURCE")
 ((${#SOURCES[@]})) || die "nothing to play in $SOURCE"
 LIVE=0; for s in "${SOURCES[@]}"; do is_url "$s" && LIVE=1; done
 ((DEBUG)) && printf '  -> %s\n' "${SOURCES[@]}" >&2
-
+ 
 # ------------------------------------------------------------------------------ playback
 TMP=$(mktemp -d)
-FF_PID="" RP_PID="" STOP=0
-
+FF_PID="" RP_PID="" STOP=0 WATCH_PID=""
+ 
+# Stop requests via a file next to the script: airplay-stop.sh writes it, so a cast can be
+# stopped from another container that shares the folder (HA core vs. SSH add-on), where
+# signals can't reach. Only requests newer than our start count; content = target filter.
+STOPFILE=$HERE/.airplay-stop STARTED=$(date +%s)
+(
+    while sleep 1; do
+        [[ -f $STOPFILE ]] || continue
+        t=$(date -r "$STOPFILE" +%s 2>/dev/null) || continue
+        ((t > STARTED)) || continue
+        want=$(cat "$STOPFILE" 2>/dev/null)
+        if [[ -z $want || $want == "$IP" || $want == "$DEVICE" ]]; then kill -TERM $$; exit; fi
+    done
+) &
+WATCH_PID=$!
+ 
 cleanup() {
+    [[ -n $WATCH_PID ]] && kill "$WATCH_PID" 2>/dev/null
     [[ -n $RP_PID ]] && kill -TERM "$RP_PID" 2>/dev/null   # cliraop sends TEARDOWN
     [[ -n $FF_PID ]] && kill -TERM "$FF_PID" 2>/dev/null
     wait 2>/dev/null; rm -rf "$TMP"
 }
 trap 'STOP=1; log "Stopping."; cleanup; exit 0' INT TERM
 trap 'rm -rf "$TMP"' EXIT
-
+ 
 ffmpeg_cmd() {
     local src=$1
-    FF=(ffmpeg -nostdin -hide_banner -loglevel "$( ((DEBUG)) && echo warning || echo error)")
+    FF=("$FFMPEG" -nostdin -hide_banner -loglevel "$( ((DEBUG)) && echo warning || echo error)")
     is_url "$src" && FF+=(-user_agent "$UA" -reconnect 1 -reconnect_streamed 1
                           -reconnect_on_network_error 1 -reconnect_delay_max 10)
     FF+=(-i "$src" -vn -map 0:a:0 -ac 2 -ar 44100 -f s16le pipe:1)
 }
-
+ 
 # play_one SRC -> 0 = input ended, 1 = connect failed, 2 = receiver lost, 3 = source failed
 play_one() {
     local src=$1 rc ffrc i port et args
@@ -265,7 +286,7 @@ play_one() {
     done
     return 1
 }
-
+ 
 attempt=0
 while :; do
     started=$SECONDS failed=0
@@ -294,3 +315,4 @@ while :; do
     log "Restarting in ${delay}s ..."
     sleep "$delay" & wait $!
 done
+ 
