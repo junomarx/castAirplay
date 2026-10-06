@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-airplay-cast.py - stream a local file or an internet radio stream to an AirPlay receiver.
+castAirplay.py - stream a local file or an internet radio stream to an AirPlay receiver.
 
-    airplay-cast.py SOURCE DEVICE [options]
+    castAirplay.py SOURCE DEVICE [options]
 
 SOURCE  local audio file, local/remote playlist (.m3u, .m3u8, .pls),
         HLS stream (.m3u8) or any http(s)/icecast URL ffmpeg can open
@@ -32,7 +32,7 @@ from pyatv.const import Protocol
 from pyatv.interface import MediaMetadata
 from pyatv.protocols.raop.audio_source import AudioSource
 
-log = logging.getLogger("airplay-cast")
+log = logging.getLogger("castAirplay")
 
 
 # Compat shim: some receivers (e.g. recent shairport-sync) answer GET /info with an
@@ -54,7 +54,7 @@ except Exception:  # pragma: no cover - pyatv internals changed, carry on withou
     pass
 
 PLAYLIST_EXT = (".m3u", ".m3u8", ".pls")
-UA = "airplay-cast/1.0"
+UA = "castAirplay/1.0"
 
 
 # --------------------------------------------------------------------------- source handling
@@ -241,7 +241,7 @@ async def play_one(atv, src: str, title: str, prebuffer: float) -> int:
     log.info("Playing %s", src)
     proc = await asyncio.create_subprocess_exec(
         *ffmpeg_cmd(src), stdout=asyncio.subprocess.PIPE)
-    source = RawPCMSource(proc.stdout, MediaMetadata(title=title, artist="airplay-cast"),
+    source = RawPCMSource(proc.stdout, MediaMetadata(title=title, artist="castAirplay"),
                           probe_duration(src))
     try:
         await source.prebuffer(prebuffer if is_url(src) else 0.5)
