@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-UA="castAirplay/1.0"
+UA="airplay-cast/1.0"
 VOLUME=50 PASSWORD="" PORT="" ET="" LATENCY_MS=2000 DEBUG=0
 LOOP=0 RETRY=1 MAX_RETRIES=0 SCAN=0
 RAOP_BIN="${CLIRAOP:-}"
@@ -105,13 +105,19 @@ SOURCE=${ARGS[0]} DEVICE=${ARGS[1]}
 
 # ------------------------------------------------------------------------------ dependencies
 command -v ffmpeg >/dev/null || die "ffmpeg not found"
+raop_runs() {  # exit 126/127 = kernel/loader can't start it (wrong arch, or needs glibc on musl)
+    "$1" -h >/dev/null 2>&1; local rc=$?; ((rc != 126 && rc != 127))
+}
 if [[ -z $RAOP_BIN ]]; then
-    for c in "$(dirname "$0")/cliraop" "./cliraop" "$(command -v cliraop 2>/dev/null)" \
-             "$(command -v raop_play 2>/dev/null)"; do
-        [[ -n $c && -x $c ]] && { RAOP_BIN=$c; break; }
+    for c in "$(dirname "$0")/cliraop-$(uname -m)" "$(dirname "$0")/cliraop" \
+             "./cliraop-$(uname -m)" "./cliraop" "$(command -v cliraop 2>/dev/null)"; do
+        [[ -n $c && -x $c ]] || continue
+        if raop_runs "$c"; then RAOP_BIN=$c; break; fi
+        log "skipping $c: can't execute here (dynamically linked for glibc, or wrong CPU architecture)"
     done
 fi
-[[ -n $RAOP_BIN && -x $RAOP_BIN ]] || die "cliraop not found - run build-cliraop.sh or use --raop PATH"
+[[ -n $RAOP_BIN && -x $RAOP_BIN ]] || die "no usable cliraop - use the static cliraop-$(uname -m), or --raop PATH"
+raop_runs "$RAOP_BIN" || die "$RAOP_BIN can't run on this system - use the static cliraop-$(uname -m)"
 
 # ------------------------------------------------------------------------------ resolve device
 IP="" TXT="" MPORT=""
@@ -130,16 +136,29 @@ fi
 # connection parameters: explicit option > mDNS TXT > defaults
 [[ -n $PORT ]] && PORTS=("$PORT") || { [[ -n $MPORT ]] && PORTS=("$MPORT") || PORTS=(7000 5000); }
 [[ -z $ET ]] && ET=$(txt_get et "$TXT")
-[[ -z $ET ]] && ET="0,4"          # unknown: plain audio + MFi auth-setup (harmless if unsupported)
+# et unknown (no avahi): try plain first, then with MFi auth-setup (newer AirPort Express firmware
+# wants it; some older receivers drop the connection when they get it)
+if [[ -n $ET ]]; then ETS=("$ET"); else ETS=("0" "0,4"); fi
+CANDS=(); for p in "${PORTS[@]}"; do for e in "${ETS[@]}"; do CANDS+=("$p $e"); done; done
 [[ $(txt_get pw "$TXT") == true && -z $PASSWORD ]] && die "receiver requires a password (-p)"
 
-RAOP_ARGS=(-v "$VOLUME" -l "$((LATENCY_MS * 441 / 10))" -t "$ET" -d "$((DEBUG ? 2 : 0))")
-[[ ,$ET, != *,0,* && ,$ET, == *,1,* ]] && RAOP_ARGS+=(-e)          # RSA-only receiver
+RAOP_ARGS=(-v "$VOLUME" -l "$((LATENCY_MS * 441 / 10))" -d "$((DEBUG ? 6 : 1))")
 [[ -n $PASSWORD ]] && RAOP_ARGS+=(-P "$PASSWORD")
 am=$(txt_get am "$TXT"); [[ -n $am ]] && RAOP_ARGS+=(-o "$am")
 md=$(txt_get md "$TXT"); [[ -n $md ]] && RAOP_ARGS+=(-m "$md")
 
-log "Receiver: ${NAME:-$IP} ($IP, port ${PORTS[*]}, et=$ET)"
+log "Receiver: ${NAME:-$IP} ($IP, port ${PORTS[*]}, et=${ETS[*]})"
+
+# AirPlay 1 needs the receiver to reach back to us (UDP timing/control). From a NAT'd container
+# (Docker, Home Assistant add-on on 172.30.x.x) it can't, and the receiver silently never plays.
+if command -v ip >/dev/null; then
+    LOCAL_IP=$(ip route get "$IP" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)
+    if [[ -n $LOCAL_IP && ${LOCAL_IP%.*} != "${IP%.*}" && $LOCAL_IP =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.) ]]; then
+        log "WARNING: local address $LOCAL_IP is not on the receiver's network - if this runs in a"
+        log "         container behind NAT (Docker, HA add-on), the receiver can't reach the timing"
+        log "         port and will stay silent. Use host networking."
+    fi
+fi
 
 # ------------------------------------------------------------------------------ resolve source
 is_url() { [[ $1 =~ ^https?:// ]]; }
@@ -212,14 +231,17 @@ ffmpeg_cmd() {
 
 # play_one SRC -> 0 = input ended, 1 = connect failed, 2 = receiver lost, 3 = source failed
 play_one() {
-    local src=$1 rc ffrc i
-    for i in "${!PORTS[@]}"; do
+    local src=$1 rc ffrc i port et args
+    for i in "${!CANDS[@]}"; do
+        read -r port et <<<"${CANDS[$i]}"
+        args=(-t "$et")
+        [[ ,$et, != *,0,* && ,$et, == *,1,* ]] && args+=(-e)       # RSA-only receiver
         log "Playing $src"
         ffmpeg_cmd "$src"
         rm -f "$TMP/ff.pid" "$TMP/ff.rc"
         # plain pipe, so EOF propagates if ffmpeg dies; the subshell records ffmpeg's PID + exit code
         { "${FF[@]}" 2>"$TMP/ffmpeg.log" & echo $! > "$TMP/ff.pid"; wait $!; echo $? > "$TMP/ff.rc"; } |
-            "$RAOP_BIN" "${RAOP_ARGS[@]}" -p "${PORTS[$i]}" "$IP" - &
+            "$RAOP_BIN" "${RAOP_ARGS[@]}" "${args[@]}" -p "$port" "$IP" - 2>"$TMP/raop.log" &
         RP_PID=$!
         until [[ -s $TMP/ff.pid ]]; do sleep 0.05; done; FF_PID=$(<"$TMP/ff.pid")
         wait "$RP_PID"; rc=$?; RP_PID=""
@@ -227,10 +249,13 @@ play_one() {
         for _ in {1..50}; do [[ -s $TMP/ff.rc ]] && break; sleep 0.1; done
         ffrc=$(cat "$TMP/ff.rc" 2>/dev/null || echo 0)
         ((STOP)) && return 0
-        if ((rc == 1 && ${#PORTS[@]} > 1)); then           # wrong port? try the next one
-            log "No answer on port ${PORTS[$i]}"; continue
+        if ((DEBUG)) || ((rc == 1 || rc == 2)); then              # show why cliraop gave up
+            [[ -s $TMP/raop.log ]] && sed 's/^/  cliraop: /' "$TMP/raop.log" >&2
         fi
-        ((rc == 1 || rc == 2)) || PORTS=("${PORTS[$i]}")   # remember the port that worked
+        if ((rc == 1 && ${#CANDS[@]} > 1)); then           # wrong port/et? try the next combination
+            log "Connection failed (port $port, et=$et)"; continue
+        fi
+        ((rc == 1 || rc == 2)) || CANDS=("${CANDS[$i]}")   # remember the combination that worked
         if ((rc == 0 && ffrc != 0 && ffrc != 143 && ffrc != 255)) || ((DEBUG)); then
             [[ -s $TMP/ffmpeg.log ]] && sed 's/^/  ffmpeg: /' "$TMP/ffmpeg.log" >&2
             ((ffrc != 0 && ffrc != 143 && ffrc != 255)) && log "ffmpeg exited with $ffrc for $src"
