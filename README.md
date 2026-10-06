@@ -4,4 +4,17 @@ This is a command-line utility for casting audio to a specified AirPlay receiver
 
 Python (requires pyatv and ffmpeg) and shell script (ffmpeg, and cliraop required) versions available. Both versions support a statically built ffmpeg binary in the script's directory, for use on small/embedded systems. Special provisions for Home Assistant (main motivation in creating this utility), the shell version will perform a system detection routine; if Home Assistant is detected, it will check if ffmpeg is available, and if not, install it.
 
-The target system to run this under is Linux.
+The target system to run this under is Linux. 
+
+Optional switches:
+  -v, --volume N        volume 0-100 (default 50)
+  -p, --password PW     AirPlay password, if the receiver has one
+  -P, --port N          RAOP port (default: from mDNS, else try 7000 then 5000)
+      --et LIST         encryption types as in mDNS 'et' (default: from mDNS, else 0,4)
+  -l, --latency MS      receiver buffer in ms (default 2000); higher = more robust radio
+      --loop            repeat file/playlist forever
+      --no-retry        don't reconnect live streams when they drop
+      --max-retries N   give up after N failed attempts in a row (default 0 = never)
+      --raop PATH       path to cliraop (default: $CLIRAOP, ./cliraop, PATH)
+      --scan            list AirPlay receivers (needs avahi-browse)
+  -d, --debug           verbose output from cliraop/ffmpeg
