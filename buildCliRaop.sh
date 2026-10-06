@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-# buildCliRaop.sh - build a patched 'cliraop' (AirPlay/RAOP sender from philippe44/libraop)
+# buildCliRaop.sh - build a patched, fully static 'cliraop' (AirPlay/RAOP sender, philippe44/libraop)
 #
-# Needs: git, make, gcc, g++  (no pip, no root). OpenSSL & codecs come prebuilt from the repo.
-# Result: ./cliraop next to this script (or path given as $1). The binary only links against
-# libc/libstdc++, so you can build it once and copy it to other machines of the same arch.
+#   ./buildCliRaop.sh [--arch x86_64|aarch64|arm|armv6|x86] [--dynamic] [OUTPUT]
+#
+# Needs a glibc-based build machine (Debian/Ubuntu/Fedora/...) with git, make, gcc, g++ and the
+# static C library (Debian/Ubuntu: libc6-dev, Fedora: glibc-static libstdc++-static).
+# The result is fully static, so it also runs on musl systems (Alpine, Home Assistant OS
+# add-ons, ...) and anything else with a Linux kernel - just copy it over.
+# libraop ships its OpenSSL/codec/mDNS dependencies prebuilt for glibc, which is why the
+# build itself can't run on musl.
+#
+# Cross-building, e.g. for a Raspberry Pi / HA Green on a PC:
+#   sudo apt install g++-aarch64-linux-gnu && ./buildCliRaop.sh --arch aarch64 cliraop-aarch64
 #
 # Patches applied on top of upstream (pinned commit):
 #   - fix -t (et) / -o (am) options, which upstream maps to the wrong fields -> MFi auth-setup
@@ -11,21 +19,49 @@
 #   - no more 100% CPU busy-wait in the send loop
 #   - clean TEARDOWN on SIGINT/SIGTERM (receiver is free again immediately)
 #   - exit code 1 = cannot connect, 2 = connection to receiver lost, 0 = input ended
+#   - numeric IPs are parsed without the system resolver (needed for static/musl use)
 set -euo pipefail
 
 COMMIT=70dffcd1b48c540c5d7ee063c54d6473ff86cbbb
-OUT=${1:-"$(cd "$(dirname "$0")" && pwd)/cliraop"}
+ARCH=$(uname -m) STATIC=1 OUT=""
 
-case "$(uname -m)" in
-    x86_64|amd64)   PLATFORM=x86_64 ;;
-    aarch64|arm64)  PLATFORM=aarch64 ;;
-    armv7*|armhf)   PLATFORM=arm ;;
-    armv6*)         PLATFORM=armv6 ;;
-    i?86)           PLATFORM=x86 ;;
-    *) echo "unsupported architecture $(uname -m)" >&2; exit 1 ;;
+while (($#)); do
+    case "$1" in
+        --arch)    ARCH=$2; shift ;;
+        --dynamic) STATIC=0 ;;
+        -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)         OUT=$1 ;;
+    esac
+    shift
+done
+OUT=${OUT:-"$(cd "$(dirname "$0")" && pwd)/cliraop"}
+
+case "$ARCH" in
+    x86_64|amd64)   PLATFORM=x86_64  TRIPLE=x86_64-linux-gnu ;;
+    aarch64|arm64)  PLATFORM=aarch64 TRIPLE=aarch64-linux-gnu ;;
+    armv7*|armhf|arm) PLATFORM=arm   TRIPLE=arm-linux-gnueabihf ;;
+    armv6*)         PLATFORM=armv6   TRIPLE=arm-linux-gnueabihf ;;
+    i?86|x86)       PLATFORM=x86     TRIPLE=i686-linux-gnu ;;
+    *) echo "unsupported architecture $ARCH" >&2; exit 1 ;;
 esac
 
-for t in git make gcc g++; do
+if ldd --version 2>&1 | grep -qi musl || compgen -G "/lib/ld-musl-*" >/dev/null; then
+    cat >&2 <<'MSG'
+This is a musl system (Alpine, Home Assistant OS add-on, ...). libraop's bundled OpenSSL,
+codec and mDNS libraries are prebuilt for glibc and can't be linked here.
+Build on any glibc Linux machine (or VM/container) instead - the result is a static binary
+that runs here unchanged:   ./buildCliRaop.sh [--arch aarch64] cliraop
+MSG
+    exit 1
+fi
+
+# native build, or cross compiler for another architecture
+if [[ $PLATFORM == "$(uname -m | sed 's/amd64/x86_64/;s/arm64/aarch64/')" ]]; then
+    CC=gcc CXX=g++ AR=ar
+else
+    CC=$TRIPLE-gcc CXX=$TRIPLE-g++ AR=$TRIPLE-ar
+fi
+for t in git make "$CC" "$CXX"; do
     command -v "$t" >/dev/null || { echo "missing build tool: $t" >&2; exit 1; }
 done
 
@@ -43,7 +79,7 @@ git submodule update -q --init crosstools curve25519 dmap-parser libcodecs libmd
 echo ">> patching"
 git apply <<'PATCH'
 diff --git a/src/cliraop.c b/src/cliraop.c
-index 0a74ad5..cd75fc8 100644
+index 0a74ad5..83b9836 100644
 --- a/src/cliraop.c
 +++ b/src/cliraop.c
 @@ -10,6 +10,7 @@
@@ -91,15 +127,27 @@ index 0a74ad5..cd75fc8 100644
  		} else if (!strcmp(argv[i], "-u")) {
  			auth = true;
  		} else if (!strcmp(argv[i],"-a")) {
-@@ -284,6 +295,7 @@ int main(int argc, char *argv[]) {
- 	player.hostent = gethostbyname(player.name);
- 	if (!player.hostent) {
- 		LOG_ERROR("Cannot resolve name %s", player.name);
-+		rc = 1;
- 		goto exit;
+@@ -281,17 +292,21 @@ int main(int argc, char *argv[]) {
  	}
  
-@@ -292,6 +304,7 @@ int main(int argc, char *argv[]) {
+ 	// get player's address
+-	player.hostent = gethostbyname(player.name);
+-	if (!player.hostent) {
+-		LOG_ERROR("Cannot resolve name %s", player.name);
+-		goto exit;
++	// numeric IP first: no resolver (NSS) needed, so a static build runs on musl/Alpine too
++	if (!inet_aton(player.name, &player.addr)) {
++		player.hostent = gethostbyname(player.name);
++		if (!player.hostent) {
++			LOG_ERROR("Cannot resolve name %s", player.name);
++			rc = 1;
++			goto exit;
++		}
++		memcpy(&player.addr.s_addr, player.hostent->h_addr_list[0], player.hostent->h_length);
+ 	}
+ 
+-	memcpy(&player.addr.s_addr, player.hostent->h_addr_list[0], player.hostent->h_length);
+-
  	// connect to player
  	if (!raopcl_connect(raopcl, player.addr, port, true)) {
  		LOG_ERROR("Cannot connect to AirPlay device %s:%hu, check firewall & port", inet_ntoa(player.addr), port);
@@ -107,7 +155,7 @@ index 0a74ad5..cd75fc8 100644
  		goto exit;
  	}
  
-@@ -333,11 +346,25 @@ int main(int argc, char *argv[]) {
+@@ -333,11 +348,25 @@ int main(int argc, char *argv[]) {
  			}
  		}
  
@@ -135,7 +183,7 @@ index 0a74ad5..cd75fc8 100644
  		}
  
  		if (interactive && kbhit()) {
-@@ -388,5 +415,5 @@ int main(int argc, char *argv[]) {
+@@ -388,5 +417,5 @@ int main(int argc, char *argv[]) {
  exit:
  	raopcl_destroy(raopcl);
  	close_platform(interactive);
@@ -144,7 +192,26 @@ index 0a74ad5..cd75fc8 100644
  }
 PATCH
 
-echo ">> building for linux/$PLATFORM"
-make -s STATIC=1 PLATFORM="$PLATFORM" HOST=linux -j"$(nproc 2>/dev/null || echo 2)" >/dev/null
+build() {  # build [LDFLAGS]
+    # -Wno-unused-result: upstream ignores asprintf() results (only matters if malloc fails)
+    # -Wno-cpp: crosstools includes <sys/poll.h>, which musl/newer libcs flag as deprecated
+    CFLAGS="${CFLAGS:-} -Wno-unused-result -Wno-cpp" LDFLAGS="$1" \
+        make -s STATIC=1 CC="$CC" CXX="$CXX" AR="$AR" PLATFORM="$PLATFORM" HOST=linux \
+             -j"$(nproc 2>/dev/null || echo 2)" 2>&1 \
+        | grep -v -e "statically linked applications requires at runtime" -e ": in function " || true
+    [[ -x bin/cliraop-linux-$PLATFORM ]]
+}
+
+rm -f "bin/cliraop-linux-$PLATFORM"      # repo ships an (unpatched) prebuilt binary
+echo ">> building for linux/$PLATFORM ($( ((STATIC)) && echo static || echo dynamic))"
+if ((STATIC)) && ! build "-static"; then
+    echo ">> static link failed (static libc missing? Fedora: dnf install glibc-static libstdc++-static)" >&2
+    echo ">> falling back to a dynamic build - that one needs glibc on the target" >&2
+    build ""
+elif ((!STATIC)); then
+    build ""
+fi
+[[ -x bin/cliraop-linux-$PLATFORM ]] || { echo "build failed" >&2; exit 1; }
+
 install -m 755 "bin/cliraop-linux-$PLATFORM" "$OUT"
-echo ">> done: $OUT"
+echo ">> done: $OUT ($(file -b "$OUT" 2>/dev/null | cut -d, -f1-2,4 || echo built))"
