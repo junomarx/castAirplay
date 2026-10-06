@@ -105,10 +105,31 @@ SOURCE=${ARGS[0]} DEVICE=${ARGS[1]}
  
 # ------------------------------------------------------------------------------ dependencies
 HERE=$(cd "$(dirname "$0")" && pwd)
-# ffmpeg: $FFMPEG, else a static ffmpeg next to this script (survives HA container rebuilds), else PATH
+# ffmpeg: $FFMPEG, else the system's ffmpeg, else one next to this script (fallback only:
+# static glibc builds can't resolve hostnames on musl systems like Alpine / Home Assistant)
+is_home_assistant() {   # HA core container or an add-on: supervisor token or HA's config marker
+    [[ -n ${SUPERVISOR_TOKEN:-}${HASSIO_TOKEN:-} || -f /config/.HA_VERSION || -f /homeassistant/.HA_VERSION ]]
+}
+apk_owned() { apk info -W "$1" 2>/dev/null | grep -q 'is owned by'; }   # native Alpine package?
+ 
 FFMPEG=${FFMPEG:-}
-[[ -z $FFMPEG && -x $HERE/ffmpeg ]] && FFMPEG=$HERE/ffmpeg
+if [[ -z $FFMPEG ]] && is_home_assistant && command -v apk >/dev/null; then
+    f=$(command -v ffmpeg)
+    if [[ -n $f ]] && apk_owned "$f"; then
+        FFMPEG=$f
+    else
+        # apk installs don't survive container rebuilds (reboot/update), so check on every start
+        log "Home Assistant: no native ffmpeg${f:+ ($f is not from apk)} - running apk add ffmpeg"
+        if apk add --no-cache -q ffmpeg >&2 && [[ -x /usr/bin/ffmpeg ]]; then
+            FFMPEG=/usr/bin/ffmpeg
+        else
+            log "WARNING: apk add ffmpeg failed (no root / no network?) - falling back"
+        fi
+    fi
+fi
 [[ -z $FFMPEG ]] && FFMPEG=$(command -v ffmpeg)
+[[ -z $FFMPEG && -x $HERE/ffmpeg ]] && FFMPEG=$HERE/ffmpeg
+((DEBUG)) && log "using ffmpeg: ${FFMPEG:-none}"
 [[ -n $FFMPEG && -x $FFMPEG ]] || die "ffmpeg not found - install it or put a static ffmpeg in $HERE"
 raop_runs() {  # exit 126/127 = kernel/loader can't start it (wrong arch, or needs glibc on musl)
     "$1" -h >/dev/null 2>&1; local rc=$?; ((rc != 126 && rc != 127))
@@ -224,6 +245,7 @@ FF_PID="" RP_PID="" STOP=0 WATCH_PID=""
 STOPFILE=$HERE/.airplay-stop STARTED=$(date +%s)
 (
     while sleep 1; do
+        kill -0 $$ 2>/dev/null || exit              # main script gone (e.g. SIGKILL): don't linger
         [[ -f $STOPFILE ]] || continue
         t=$(date -r "$STOPFILE" +%s 2>/dev/null) || continue
         ((t > STARTED)) || continue
@@ -240,7 +262,7 @@ cleanup() {
     wait 2>/dev/null; rm -rf "$TMP"
 }
 trap 'STOP=1; log "Stopping."; cleanup; exit 0' INT TERM
-trap 'rm -rf "$TMP"' EXIT
+trap '[[ -n $WATCH_PID ]] && kill "$WATCH_PID" 2>/dev/null; rm -rf "$TMP"' EXIT
  
 ffmpeg_cmd() {
     local src=$1
