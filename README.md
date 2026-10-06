@@ -6,15 +6,15 @@ Python (requires pyatv and ffmpeg) and shell script (ffmpeg, and cliraop require
 
 The target system to run this under is Linux. 
 
-Optional switches:
-  -v, --volume N        volume 0-100 (default 50)
-  -p, --password PW     AirPlay password, if the receiver has one
-  -P, --port N          RAOP port (default: from mDNS, else try 7000 then 5000)
-      --et LIST         encryption types as in mDNS 'et' (default: from mDNS, else 0,4)
-  -l, --latency MS      receiver buffer in ms (default 2000); higher = more robust radio
-      --loop            repeat file/playlist forever
-      --no-retry        don't reconnect live streams when they drop
-      --max-retries N   give up after N failed attempts in a row (default 0 = never)
-      --raop PATH       path to cliraop (default: $CLIRAOP, ./cliraop, PATH)
-      --scan            list AirPlay receivers (needs avahi-browse)
-  -d, --debug           verbose output from cliraop/ffmpeg
+Optional switches: <br>
+  -v, --volume N        volume 0-100 (default 50) <br>
+  -p, --password PW     AirPlay password, if the receiver has one <br>
+  -P, --port N          RAOP port (default: from mDNS, else try 7000 then 5000) <br>
+      --et LIST         encryption types as in mDNS 'et' (default: from mDNS, else 0,4) <br>
+  -l, --latency MS      receiver buffer in ms (default 2000); higher = more robust radio <br>
+      --loop            repeat file/playlist forever <br>
+      --no-retry        don't reconnect live streams when they drop <br>
+      --max-retries N   give up after N failed attempts in a row (default 0 = never) <br>
+      --raop PATH       path to cliraop (default: $CLIRAOP, ./cliraop, PATH) <br>
+      --scan            list AirPlay receivers (needs avahi-browse) <br>
+  -d, --debug           verbose output from cliraop/ffmpeg <br>
