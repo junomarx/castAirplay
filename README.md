@@ -4,3 +4,4 @@ This is a utility for casting audio to a specified AirPlay receiver on the netwo
 
 Python (requires pyatv and ffmpeg) and shell script (ffmpeg, and cliraop required) versions available.
 
+The target system to run this under is Linux.
