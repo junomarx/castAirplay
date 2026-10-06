@@ -20,7 +20,13 @@
 #   - clean TEARDOWN on SIGINT/SIGTERM (receiver is free again immediately)
 #   - exit code 1 = cannot connect, 2 = connection to receiver lost, 0 = input ended
 #   - numeric IPs are parsed without the system resolver (needed for static/musl use)
+if grep -q $'\r' "$0"; then echo "$0 has Windows (CRLF) line endings - fix: sed -i 's/\r$//' $0" >&2; exit 1; fi #
 set -euo pipefail
+
+# All repos are public: never prompt for credentials. A prompt only ever means "repo not found"
+# (GitHub answers 401 for those), so fail with a readable error instead.
+export GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never GIT_ASKPASS=true SSH_ASKPASS=true
+git() { command git -c credential.helper= "$@"; }
 
 COMMIT=70dffcd1b48c540c5d7ee063c54d6473ff86cbbb
 ARCH=$(uname -m) STATIC=1 OUT=""
@@ -50,7 +56,7 @@ if ldd --version 2>&1 | grep -qi musl || compgen -G "/lib/ld-musl-*" >/dev/null;
 This is a musl system (Alpine, Home Assistant OS add-on, ...). libraop's bundled OpenSSL,
 codec and mDNS libraries are prebuilt for glibc and can't be linked here.
 Build on any glibc Linux machine (or VM/container) instead - the result is a static binary
-that runs here unchanged:   ./buildCliRaop.sh [--arch aarch64] cliraop
+that runs here unchanged:   ./build-cliraop.sh [--arch aarch64] cliraop
 MSG
     exit 1
 fi
@@ -70,11 +76,16 @@ trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
 
 echo ">> fetching libraop @ ${COMMIT:0:7}"
-git clone -q https://github.com/philippe44/libraop.git
+git clone -q https://github.com/philippe44/libraop.git || {
+    echo "!! cannot clone https://github.com/philippe44/libraop - check network/proxy and git config" >&2
+    echo "   (url.*.insteadOf rewrites in ~/.gitconfig are a common cause: git config -l | grep -i url)" >&2
+    exit 1; }
 cd libraop
 git checkout -q "$COMMIT"
 # top-level submodules only: libopenssl/libcodecs/libmdns ship prebuilt static libs
-git submodule update -q --init crosstools curve25519 dmap-parser libcodecs libmdns libopenssl
+for m in crosstools curve25519 dmap-parser libcodecs libmdns libopenssl; do
+    git submodule update -q --init "$m" || { echo "!! cannot fetch submodule $m ($(git config -f .gitmodules "submodule.$m.url"))" >&2; exit 1; }
+done
 
 echo ">> patching"
 git apply <<'PATCH'
