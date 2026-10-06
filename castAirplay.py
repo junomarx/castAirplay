@@ -20,49 +20,50 @@ import ipaddress
 import logging
 import os
 import signal
+import socket
 import subprocess
 import time
 import urllib.parse
 import urllib.request
-
+ 
 import pyatv
 import pyatv.exceptions
 import pyatv.protocols.raop as _raop
 from pyatv.const import Protocol
 from pyatv.interface import MediaMetadata
 from pyatv.protocols.raop.audio_source import AudioSource
-
-log = logging.getLogger("castAirplay")
-
-
+ 
+log = logging.getLogger("airplay-cast")
+ 
+ 
 # Compat shim: some receivers (e.g. recent shairport-sync) answer GET /info with an
 # empty 200 body, which makes pyatv crash. Treat that like "no /info support".
 try:
     from pyatv.support import rtsp as _rtsp
-
+ 
     _orig_info = _rtsp.RtspSession.info
-
+ 
     async def _safe_info(self):
         try:
             return await _orig_info(self)
         except Exception as e:  # noqa: BLE001
             log.debug("Ignoring unparsable /info response: %s", e)
             return {}
-
+ 
     _rtsp.RtspSession.info = _safe_info
 except Exception:  # pragma: no cover - pyatv internals changed, carry on without shim
     pass
-
+ 
 PLAYLIST_EXT = (".m3u", ".m3u8", ".pls")
-UA = "castAirplay/1.0"
-
-
+UA = "airplay-cast/1.0"
+ 
+ 
 # --------------------------------------------------------------------------- source handling
-
+ 
 def is_url(s: str) -> bool:
     return urllib.parse.urlparse(s).scheme in ("http", "https")
-
-
+ 
+ 
 def read_text(src: str) -> str:
     if is_url(src):
         req = urllib.request.Request(src, headers={"User-Agent": UA})
@@ -70,20 +71,20 @@ def read_text(src: str) -> str:
             return r.read(256 * 1024).decode("utf-8", errors="replace")
     with open(src, encoding="utf-8", errors="replace") as f:
         return f.read()
-
-
+ 
+ 
 def resolve(src: str, depth: int = 0) -> list[str]:
     """Turn SOURCE into a list of things ffmpeg can open directly."""
     path = urllib.parse.urlparse(src).path.lower() if is_url(src) else src.lower()
     if depth > 3 or not path.endswith(PLAYLIST_EXT):
         return [src]
-
+ 
     text = read_text(src)
-
+ 
     # HLS (.m3u8 with #EXT-X- tags): ffmpeg handles it natively
     if "#EXT-X-" in text:
         return [src]
-
+ 
     base = src if is_url(src) else os.path.dirname(os.path.abspath(src)) + os.sep
     entries = []
     if path.endswith(".pls"):
@@ -97,7 +98,7 @@ def resolve(src: str, depth: int = 0) -> list[str]:
     else:
         entries = [l.strip() for l in text.splitlines()
                    if l.strip() and not l.lstrip().startswith("#")]
-
+ 
     out = []
     for e in entries:
         if not is_url(e) and not os.path.isabs(e):
@@ -106,18 +107,28 @@ def resolve(src: str, depth: int = 0) -> list[str]:
     if not out:
         raise ValueError(f"playlist {src} contains no entries")
     return out
-
-
+ 
+ 
+HERE = os.path.dirname(os.path.abspath(__file__))
+STOPFILE = os.path.join(HERE, ".airplay-stop")
+ 
+ 
+def ffmpeg_bin() -> str:
+    """$FFMPEG, else a static ffmpeg next to this script, else whatever is on PATH."""
+    local = os.path.join(HERE, "ffmpeg")
+    return os.environ.get("FFMPEG") or (local if os.access(local, os.X_OK) else "ffmpeg")
+ 
+ 
 def ffmpeg_cmd(src: str) -> list[str]:
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
+    cmd = [ffmpeg_bin(), "-nostdin", "-hide_banner", "-loglevel", "error"]
     if is_url(src):
         cmd += ["-user_agent", UA, "-reconnect", "1", "-reconnect_streamed", "1",
                 "-reconnect_on_network_error", "1", "-reconnect_delay_max", "10"]
     cmd += ["-i", src, "-vn", "-map", "0:a:0",
             "-ac", "2", "-ar", "44100", "-f", "s16be", "pipe:1"]  # L16 = network byte order
     return cmd
-
-
+ 
+ 
 def probe_duration(src: str) -> int:
     if is_url(src):
         return 0
@@ -127,18 +138,18 @@ def probe_duration(src: str) -> int:
         return int(float(out.stdout.strip()))
     except Exception:  # noqa: BLE001
         return 0
-
-
+ 
+ 
 class RawPCMSource(AudioSource):
     """Feeds ffmpeg's raw s16be/44.1k/stereo output straight into pyatv (no re-decoding).
-
+ 
     A background task keeps reading from the pipe into a buffer, so short network
     stalls of a radio stream are absorbed by the prebuffer instead of causing dropouts.
     """
-
+ 
     RATE, CHANNELS, SAMPLE_SIZE = 44100, 2, 2
     FRAME = CHANNELS * SAMPLE_SIZE
-
+ 
     def __init__(self, reader: asyncio.StreamReader, metadata: MediaMetadata, duration: int):
         self._reader = reader
         self._metadata = metadata
@@ -147,7 +158,7 @@ class RawPCMSource(AudioSource):
         self._eof = False
         self._data = asyncio.Event()
         self._task = asyncio.ensure_future(self._fill())
-
+ 
     async def _fill(self):
         while True:
             chunk = await self._reader.read(65536)
@@ -157,7 +168,7 @@ class RawPCMSource(AudioSource):
                 return
             self._buf += chunk
             self._data.set()
-
+ 
     async def prebuffer(self, seconds: float):
         want = int(seconds * self.RATE) * self.FRAME
         while len(self._buf) < want and not self._eof:
@@ -165,7 +176,7 @@ class RawPCMSource(AudioSource):
             await self._data.wait()
         if not self._buf:
             raise RuntimeError("source produced no audio")
-
+ 
     async def readframes(self, nframes: int) -> bytes:
         need = nframes * self.FRAME
         while len(self._buf) < need and not self._eof:
@@ -175,37 +186,55 @@ class RawPCMSource(AudioSource):
         out = bytes(self._buf[:n])
         del self._buf[:n]
         return out
-
+ 
     async def get_metadata(self) -> MediaMetadata:
         return self._metadata
-
+ 
     async def close(self) -> None:
         self._task.cancel()
-
+ 
     sample_rate = property(lambda self: self.RATE)
     channels = property(lambda self: self.CHANNELS)
     sample_size = property(lambda self: self.SAMPLE_SIZE)
     duration = property(lambda self: self._duration)
-
-
+ 
+ 
 # Let pyatv's stream_file() accept our RawPCMSource as-is instead of running it through
 # miniaudio (whose pipe/stream decoding is unreliable for endless radio streams).
 _orig_open_source = _raop.open_source
-
-
+ 
+ 
 async def _open_source(source, sample_rate, channels, sample_size):
     if isinstance(source, RawPCMSource):
         if (sample_rate, channels, sample_size) != (source.RATE, source.CHANNELS, source.SAMPLE_SIZE):
             raise RuntimeError(f"receiver wants {sample_rate}/{channels}ch/{sample_size * 8}bit")
         return source
     return await _orig_open_source(source, sample_rate, channels, sample_size)
-
-
+ 
+ 
 _raop.open_source = _open_source
-
-
+ 
+ 
 # --------------------------------------------------------------------------- AirPlay handling
-
+ 
+def nat_warning(receiver: str) -> None:
+    """AirPlay 1 needs the receiver to reach back to us (UDP timing/control ports).
+    From inside a NAT'd container (e.g. a Home Assistant add-on on 172.30.x.x) it can't,
+    and the receiver silently never starts playing."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((receiver, 9))            # no packet is sent, just picks the route
+            local = s.getsockname()[0]
+        local_ip, remote_ip = ipaddress.ip_address(local), ipaddress.ip_address(receiver)
+    except (OSError, ValueError):
+        return
+    same_net = ipaddress.ip_network(f"{local}/24", strict=False) == \
+        ipaddress.ip_network(f"{receiver}/24", strict=False)
+    if local_ip.is_private and remote_ip.is_private and not same_net:
+        log.warning("Local address %s is not on the receiver's network - if this runs in a "
+                    "container (Docker, HA add-on) behind NAT, the receiver can't reach the "
+                    "timing port and will stay silent. Use host networking.", local)
+ 
 async def find_device(target: str, timeout: int):
     loop = asyncio.get_running_loop()
     try:
@@ -213,7 +242,7 @@ async def find_device(target: str, timeout: int):
         is_ip = True
     except ValueError:
         is_ip = False
-
+ 
     found = []
     if is_ip:  # unicast query straight to the device - fast, works across VLANs
         found = await pyatv.scan(loop, hosts=[target], timeout=timeout)
@@ -226,22 +255,22 @@ async def find_device(target: str, timeout: int):
     if not found:
         raise SystemExit(f"No AirPlay (RAOP) receiver matching '{target}' found. Try --scan.")
     return found[0]
-
-
+ 
+ 
 async def scan(timeout: int):
     for c in await pyatv.scan(asyncio.get_running_loop(), timeout=timeout):
         raop = c.get_service(Protocol.RAOP)
         if raop:
             print(f"{c.name:30} {str(c.address):16} id={c.identifier}  "
                   f"model={c.device_info.model_str}")
-
-
+ 
+ 
 async def play_one(atv, src: str, title: str, prebuffer: float) -> int:
     """Stream a single source. Returns ffmpeg's exit code."""
     log.info("Playing %s", src)
     proc = await asyncio.create_subprocess_exec(
         *ffmpeg_cmd(src), stdout=asyncio.subprocess.PIPE)
-    source = RawPCMSource(proc.stdout, MediaMetadata(title=title, artist="castAirplay"),
+    source = RawPCMSource(proc.stdout, MediaMetadata(title=title, artist="airplay-cast"),
                           probe_duration(src))
     try:
         await source.prebuffer(prebuffer if is_url(src) else 0.5)
@@ -252,18 +281,19 @@ async def play_one(atv, src: str, title: str, prebuffer: float) -> int:
             proc.terminate()
         rc = await proc.wait()
     return rc
-
-
+ 
+ 
 async def run(args):
     sources = resolve(args.source)
     live = any(is_url(s) for s in sources)
     log.debug("Resolved to: %s", sources)
-
+ 
     conf = await find_device(args.device, args.timeout)
     if args.password:
         conf.get_service(Protocol.RAOP).password = args.password
     log.info("Receiver: %s (%s)", conf.name, conf.address)
-
+    nat_warning(str(conf.address))
+ 
     title = args.title or os.path.basename(urllib.parse.urlparse(args.source).path) or args.source
     attempt = 0
     while True:
@@ -289,7 +319,7 @@ async def run(args):
                 atv.close()
         if time.monotonic() - started > 60:  # ran fine for a while -> reset backoff
             attempt = 0
-
+ 
         # Files/playlists: done (unless --loop). Live streams: reconnect (unless --no-retry).
         if not (args.loop or (live and not args.no_retry)):
             break
@@ -299,8 +329,8 @@ async def run(args):
         delay = min(30, 2 ** min(attempt, 5))
         log.info("Restarting in %ss ...", delay)
         await asyncio.sleep(delay)
-
-
+ 
+ 
 def main():
     p = argparse.ArgumentParser(description="Stream a file or internet radio to an AirPlay receiver.")
     p.add_argument("source", nargs="?", help="file, playlist (.m3u/.m3u8/.pls) or stream URL")
@@ -317,7 +347,7 @@ def main():
     p.add_argument("--timeout", type=int, default=5, help="discovery timeout in seconds")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
-
+ 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
     if not args.debug:
@@ -327,7 +357,7 @@ def main():
         return
     if not args.source or not args.device:
         p.error("SOURCE and DEVICE are required (or use --scan)")
-
+ 
     async def _main():
         # Ctrl-C / SIGTERM (e.g. systemd stop) -> cancel cleanly so ffmpeg and the
         # AirPlay session are torn down properly instead of being left dangling.
@@ -335,13 +365,33 @@ def main():
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, task.cancel)
+        started = time.time()
+ 
+        async def watch_stopfile():
+            # airplay-stop.sh writes .airplay-stop next to the scripts, so casts can be stopped
+            # from another container sharing the folder; content = optional receiver filter
+            while True:
+                await asyncio.sleep(1)
+                try:
+                    if os.path.getmtime(STOPFILE) > started:
+                        want = open(STOPFILE).read().strip()
+                        if want in ("", args.device):
+                            log.info("Stop requested via %s", STOPFILE)
+                            task.cancel()
+                            return
+                except OSError:
+                    pass
+ 
+        watcher = asyncio.ensure_future(watch_stopfile())
         try:
             await run(args)
         except asyncio.CancelledError:
             log.info("Stopped.")
-
+        finally:
+            watcher.cancel()
+ 
     asyncio.run(_main())
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
